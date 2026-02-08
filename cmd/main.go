@@ -12,29 +12,34 @@ func main() {
 	ctrl := controller.NewOrderController(log)
 
 	// Simulate the order management system
-	// This demonstrates all the requirements
+	// This demonstrates VIP priority and multiple VIP orders scenario
 
-	// Create some orders
-	ctrl.CreateNormalOrder()
-	ctrl.CreateVIPOrder()
-	ctrl.CreateNormalOrder()
-
-	// Add bots to process orders
-	ctrl.AddBot()
+	// Step 1: Add one bot first
 	ctrl.AddBot()
 
-	// Wait for some processing
-	ctrl.Wait(12 * 1000) // 12 seconds
+	// Step 2: Create Normal Order first, then VIP Order
+	// This demonstrates VIP priority - VIP should be picked up first
+	ctrl.CreateNormalOrder()  // Order #1001 (Normal)
+	ctrl.CreateVIPOrder()     // Order #1002 (VIP) - Should be picked up FIRST!
 
-	// Create another VIP order while processing
-	ctrl.CreateVIPOrder()
-	ctrl.Wait(12 * 1000) // Wait for completion
+	// Wait to see VIP order gets processed first
+	ctrl.Wait(12 * 1000) // Wait 12 seconds for VIP order to complete
 
-	// Remove a bot
-	ctrl.RemoveBot()
+	// Step 3: Demonstrate multiple VIP orders scenario
+	// Create multiple VIP orders - they should queue behind existing VIP orders
+	ctrl.CreateVIPOrder()     // Order #1003 (VIP) - Will queue after #1002
+	ctrl.CreateVIPOrder()     // Order #1004 (VIP) - Will queue after #1003
+	ctrl.CreateNormalOrder()  // Order #1005 (Normal) - Will queue after all VIPs
+	ctrl.CreateNormalOrder()  // Order #1006 (Normal) - Will queue after #1005
 
-	// Final wait
-	ctrl.Wait(1 * 1000)
+	// Wait for processing
+	ctrl.Wait(12 * 1000) // Wait for next order to complete
+
+	// Step 4: Add another bot to process orders faster
+	ctrl.AddBot()
+
+	// Wait for remaining orders to complete
+	ctrl.Wait(15 * 1000) // Wait for remaining orders
 
 	// Output final status
 	ctrl.PrintStatus()
