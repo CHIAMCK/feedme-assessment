@@ -3,6 +3,7 @@ package controller
 import (
 	"se-take-home-assignment/internal/logger"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -52,8 +53,8 @@ type OrderController struct {
 	pendingOrders []*Order
 	completedOrders []*Order
 	bots          []*Bot
-	nextOrderID   int
-	nextBotID     int
+	nextOrderID   int64 // Use int64 for atomic operations
+	nextBotID     int64 // Use int64 for atomic operations
 	mu            sync.Mutex
 }
 
@@ -70,10 +71,7 @@ func NewOrderController(log *logger.Logger) *OrderController {
 }
 
 func (oc *OrderController) CreateNormalOrder() {
-	oc.mu.Lock()
-	orderID := oc.nextOrderID
-	oc.nextOrderID++
-	oc.mu.Unlock()
+	orderID := int(atomic.AddInt64(&oc.nextOrderID, 1) - 1)
 
 	order := &Order{
 		ID:      orderID,
@@ -92,10 +90,7 @@ func (oc *OrderController) CreateNormalOrder() {
 }
 
 func (oc *OrderController) CreateVIPOrder() {
-	oc.mu.Lock()
-	orderID := oc.nextOrderID
-	oc.nextOrderID++
-	oc.mu.Unlock()
+	orderID := int(atomic.AddInt64(&oc.nextOrderID, 1) - 1)
 
 	order := &Order{
 		ID:      orderID,
@@ -106,21 +101,7 @@ func (oc *OrderController) CreateVIPOrder() {
 
 	oc.mu.Lock()
 	oc.orders = append(oc.orders, order)
-	
-	// Insert VIP order: after all VIP orders, before all normal orders
-	insertIndex := 0
-	for i, pendingOrder := range oc.pendingOrders {
-		if pendingOrder.Type == OrderTypeVIP {
-			insertIndex = i + 1
-		}
-	}
-	
-	// Insert at the correct position
-	if insertIndex >= len(oc.pendingOrders) {
-		oc.pendingOrders = append(oc.pendingOrders, order)
-	} else {
-		oc.pendingOrders = append(oc.pendingOrders[:insertIndex], append([]*Order{order}, oc.pendingOrders[insertIndex:]...)...)
-	}
+	oc.insertVIPOrder(order)
 	oc.mu.Unlock()
 
 	oc.logger.Log("Created VIP Order #%d - Status: PENDING", orderID)
@@ -128,10 +109,7 @@ func (oc *OrderController) CreateVIPOrder() {
 }
 
 func (oc *OrderController) AddBot() {
-	oc.mu.Lock()
-	botID := oc.nextBotID
-	oc.nextBotID++
-	oc.mu.Unlock()
+	botID := int(atomic.AddInt64(&oc.nextBotID, 1) - 1)
 
 	bot := &Bot{
 		ID:       botID,
@@ -148,59 +126,75 @@ func (oc *OrderController) AddBot() {
 }
 
 func (oc *OrderController) RemoveBot() {
-	oc.mu.Lock()
-	if len(oc.bots) == 0 {
-		oc.mu.Unlock()
+	bot := oc.removeBotFromList()
+	if bot == nil {
 		return
 	}
 
-	// Remove the newest bot (last in the slice)
+	order, isProcessing := oc.stopBotProcessing(bot)
+	if !isProcessing {
+		oc.handleIdleBotRemoval(bot)
+		return
+	}
+
+	oc.handleProcessingBotRemoval(bot, order)
+}
+
+// stopBotProcessing stops the bot's processing and returns the order if it was processing
+// Returns (order, true) if bot was processing, (nil, false) if idle
+func (oc *OrderController) stopBotProcessing(bot *Bot) (*Order, bool) {
+	bot.mu.Lock()
+	defer bot.mu.Unlock()
+
+	isProcessing := bot.Status == BotStatusProcessing && bot.Order != nil
+	if !isProcessing {
+		return nil, false
+	}
+
+	bot.stopChan <- true
+	order := bot.Order
+	order.Status = OrderStatusPending
+	order.BotID = 0
+	return order, true
+}
+
+// handleIdleBotRemoval handles the removal of an idle bot
+func (oc *OrderController) handleIdleBotRemoval(bot *Bot) {
+	oc.logger.Log("Bot #%d destroyed while IDLE", bot.ID)
+	oc.assignOrdersToBots()
+}
+
+// handleProcessingBotRemoval handles the removal of a processing bot
+// Returns the order back to the pending queue with proper priority
+func (oc *OrderController) handleProcessingBotRemoval(bot *Bot, order *Order) {
+	oc.mu.Lock()
+	oc.insertOrderToPending(order)
+	oc.mu.Unlock()
+
+	oc.logger.Log("Bot #%d destroyed while processing Order #%d - Order returned to PENDING", bot.ID, order.ID)
+	oc.assignOrdersToBots()
+}
+
+// removeBotFromList removes and returns the newest bot (last in the slice)
+// Returns nil if no bots exist. This function handles locking internally.
+func (oc *OrderController) removeBotFromList() *Bot {
+	oc.mu.Lock()
+	defer oc.mu.Unlock()
+
+	if len(oc.bots) == 0 {
+		return nil
+	}
+
 	botIndex := len(oc.bots) - 1
 	bot := oc.bots[botIndex]
 	oc.bots = oc.bots[:botIndex]
-	oc.mu.Unlock()
-
-	bot.mu.Lock()
-	if bot.Status == BotStatusProcessing && bot.Order != nil {
-		// Stop processing and return order to pending
-		bot.stopChan <- true
-		order := bot.Order
-		order.Status = OrderStatusPending
-		order.BotID = 0
-		
-		oc.mu.Lock()
-		// Re-insert order back to pending queue with proper priority
-		if order.Type == OrderTypeVIP {
-			insertIndex := 0
-			for i, pendingOrder := range oc.pendingOrders {
-				if pendingOrder.Type == OrderTypeVIP {
-					insertIndex = i + 1
-				}
-			}
-			if insertIndex >= len(oc.pendingOrders) {
-				oc.pendingOrders = append(oc.pendingOrders, order)
-			} else {
-				oc.pendingOrders = append(oc.pendingOrders[:insertIndex], append([]*Order{order}, oc.pendingOrders[insertIndex:]...)...)
-			}
-		} else {
-			oc.pendingOrders = append(oc.pendingOrders, order)
-		}
-		oc.mu.Unlock()
-		
-		oc.logger.Log("Bot #%d destroyed while processing Order #%d - Order returned to PENDING", bot.ID, order.ID)
-	} else {
-		oc.logger.Log("Bot #%d destroyed while IDLE", bot.ID)
-	}
-	bot.mu.Unlock()
-
-	oc.assignOrdersToBots()
+	return bot
 }
 
 func (oc *OrderController) assignOrdersToBots() {
 	oc.mu.Lock()
 	defer oc.mu.Unlock()
 
-	// Find idle bots
 	for _, bot := range oc.bots {
 		bot.mu.Lock()
 		if bot.Status == BotStatusIdle && len(oc.pendingOrders) > 0 {
@@ -215,10 +209,9 @@ func (oc *OrderController) assignOrdersToBots() {
 			order.BotID = bot.ID
 			order.Started = time.Now()
 
-			oc.logger.Log("Bot #%d picked up %s Order #%d - Status: PROCESSING", 
+			oc.logger.Log("Bot #%d picked up %s Order #%d - Status: PROCESSING",
 				bot.ID, oc.getOrderTypeString(order.Type), order.ID)
 
-			// Start processing in a goroutine
 			go oc.processOrder(bot)
 		}
 		bot.mu.Unlock()
@@ -226,65 +219,69 @@ func (oc *OrderController) assignOrdersToBots() {
 }
 
 func (oc *OrderController) processOrder(bot *Bot) {
-	// Process for 10 seconds
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
-	
+
 	startTime := time.Now()
 	duration := 10 * time.Second
 
 	for {
 		select {
 		case <-bot.stopChan:
-			// Bot was removed, stop processing
 			return
 		case <-ticker.C:
 			if time.Since(startTime) >= duration {
-				// Order completed
-				bot.mu.Lock()
-				if bot.Order != nil {
-					order := bot.Order
-					order.Status = OrderStatusComplete
-					order.Completed = time.Now()
-					processingTime := order.Completed.Sub(order.Started)
-					
-					oc.mu.Lock()
-					oc.completedOrders = append(oc.completedOrders, order)
-					oc.mu.Unlock()
-
-				oc.logger.Log("Bot #%d completed %s Order #%d - Status: COMPLETE (Processing time: %ds)", 
-					bot.ID, oc.getOrderTypeString(order.Type), order.ID, int(processingTime.Seconds()))
-
-				bot.Order = nil
-				bot.Status = BotStatusIdle
-			}
-			bot.mu.Unlock()
-
-			// Try to assign another order
-			oc.mu.Lock()
-			hasPendingOrders := len(oc.pendingOrders) > 0
-			oc.mu.Unlock()
-			
-			oc.assignOrdersToBots()
-			
-			// If no pending orders after assignment, log idle status
-			if !hasPendingOrders {
-				bot.mu.Lock()
-				if bot.Status == BotStatusIdle {
-					oc.logger.Log("Bot #%d is now IDLE - No pending orders", bot.ID)
+				order := oc.completeOrderProcessing(bot)
+				if order == nil {
+					return
 				}
-				bot.mu.Unlock()
-			}
-			return
+				oc.finalizeOrderCompletion(bot, order)
+				return
 			}
 		}
 	}
 }
 
+// completeOrderProcessing marks the order as complete and sets bot to idle
+// Returns the completed order, or nil if bot has no order
+func (oc *OrderController) completeOrderProcessing(bot *Bot) *Order {
+	bot.mu.Lock()
+	defer bot.mu.Unlock()
+
+	if bot.Order == nil {
+		return nil
+	}
+
+	order := bot.Order
+	order.Status = OrderStatusComplete
+	order.Completed = time.Now()
+	bot.Order = nil
+	bot.Status = BotStatusIdle
+	return order
+}
+
+// finalizeOrderCompletion updates completed orders, logs completion, and assigns next order
+func (oc *OrderController) finalizeOrderCompletion(bot *Bot, order *Order) {
+	processingTime := order.Completed.Sub(order.Started)
+
+	oc.mu.Lock()
+	oc.completedOrders = append(oc.completedOrders, order)
+	hasPendingOrders := len(oc.pendingOrders) > 0
+	oc.mu.Unlock()
+
+	oc.logger.Log("Bot #%d completed %s Order #%d - Status: COMPLETE (Processing time: %ds)",
+		bot.ID, oc.getOrderTypeString(order.Type), order.ID, int(processingTime.Seconds()))
+
+	oc.assignOrdersToBots()
+
+	if !hasPendingOrders {
+		oc.logger.Log("Bot #%d is now IDLE - No pending orders", bot.ID)
+	}
+}
+
 func (oc *OrderController) Wait(milliseconds int) {
 	time.Sleep(time.Duration(milliseconds) * time.Millisecond)
-	
-	// Check if any bots became idle and need new orders
+
 	oc.assignOrdersToBots()
 }
 
@@ -295,26 +292,58 @@ func (oc *OrderController) PrintStatus() {
 	vipCount := 0
 	normalCount := 0
 	for _, order := range oc.completedOrders {
-		if order.Type == OrderTypeVIP {
+		switch order.Type {
+		case OrderTypeVIP:
 			vipCount++
-		} else {
+		case OrderTypeNormal:
 			normalCount++
 		}
 	}
 
 	oc.logger.Log("")
 	oc.logger.Log("Final Status:")
-	oc.logger.Log("- Total Orders Processed: %d (%d VIP, %d Normal)", 
+	oc.logger.Log("- Total Orders Processed: %d (%d VIP, %d Normal)",
 		len(oc.completedOrders), vipCount, normalCount)
 	oc.logger.Log("- Orders Completed: %d", len(oc.completedOrders))
 	oc.logger.Log("- Active Bots: %d", len(oc.bots))
 	oc.logger.Log("- Pending Orders: %d", len(oc.pendingOrders))
 }
 
+// insertOrderToPending inserts an order into the pending queue with proper priority
+// VIP orders are placed after all existing VIP orders but before all normal orders
+// Normal orders are appended to the end
+func (oc *OrderController) insertOrderToPending(order *Order) {
+	switch order.Type {
+	case OrderTypeVIP:
+		oc.insertVIPOrder(order)
+	case OrderTypeNormal:
+		oc.pendingOrders = append(oc.pendingOrders, order)
+	}
+}
+
+// insertVIPOrder inserts a VIP order into the pending queue
+// VIP orders are placed after all existing VIP orders but before all normal orders
+func (oc *OrderController) insertVIPOrder(order *Order) {
+	// Find the insertion index: after all VIP orders, before all normal orders
+	insertIndex := 0
+	for i, pendingOrder := range oc.pendingOrders {
+		if pendingOrder.Type == OrderTypeVIP {
+			insertIndex = i + 1
+		}
+	}
+
+	newPendingOrders := make([]*Order, 0, len(oc.pendingOrders)+1)
+	newPendingOrders = append(newPendingOrders, oc.pendingOrders[:insertIndex]...)
+	newPendingOrders = append(newPendingOrders, order)
+	newPendingOrders = append(newPendingOrders, oc.pendingOrders[insertIndex:]...)
+	oc.pendingOrders = newPendingOrders
+}
+
 func (oc *OrderController) getOrderTypeString(orderType OrderType) string {
 	if orderType == OrderTypeVIP {
 		return "VIP"
 	}
+
 	return "Normal"
 }
 
